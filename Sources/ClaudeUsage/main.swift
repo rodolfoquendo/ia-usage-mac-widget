@@ -6,7 +6,7 @@ import Foundation
 private let claudeUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 private let claudeKeychainService = "Claude Code-credentials"
 private let codexSessionsDir = ("~/.codex/sessions" as NSString).expandingTildeInPath
-private let pollInterval: TimeInterval = 60 // seconds
+private let pollInterval: TimeInterval = 300 // seconds
 
 // MARK: - Claude API models
 
@@ -163,8 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
 
-    private var claude: ClaudeUsageResponse?
-    private var claudeError: String?
+    private var claude: ClaudeUsageResponse?      // last good reading (kept across transient errors)
+    private var claudeUpdatedAt: Date?            // when that reading arrived
+    private var claudeNote: String?               // transient status (rate limited / error)
+    private var claudeBackoffUntil: Date?         // skip Claude network calls until this time
     private var codex: CodexSnapshot?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -181,10 +183,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Codex: local file read, cheap, synchronous.
         codex = readCodexSnapshot()
 
-        // Claude: network.
+        // Claude: network. Skip while backing off from a 429 so we don't keep
+        // the rate limit tripped — but a manual "Refresh now" clears the backoff.
+        if let until = claudeBackoffUntil, until > Date() {
+            DispatchQueue.main.async { self.render() }
+            return
+        }
+
         guard let token = readClaudeToken() else {
-            claude = nil
-            claudeError = "No Claude token in Keychain (sign in with Claude Code)."
+            claudeNote = "No Claude token in Keychain (sign in with Claude Code)."
             DispatchQueue.main.async { self.render() }
             return
         }
@@ -196,21 +203,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
             guard let self else { return }
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             if let error {
-                self.claude = nil; self.claudeError = error.localizedDescription
-            } else if let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data, let usage = try? JSONDecoder().decode(ClaudeUsageResponse.self, from: data) {
-                self.claude = usage; self.claudeError = nil
+                self.claudeNote = error.localizedDescription // keep last good reading
+            } else if code == 200, let data,
+                      let usage = try? JSONDecoder().decode(ClaudeUsageResponse.self, from: data) {
+                self.claude = usage
+                self.claudeUpdatedAt = Date()
+                self.claudeNote = nil
+                self.claudeBackoffUntil = nil
+            } else if code == 429 {
+                let header = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After")
+                let backoff = max(Double(header ?? "") ?? 0, 900) // floor 15 min
+                let until = Date().addingTimeInterval(backoff)
+                self.claudeBackoffUntil = until
+                self.claudeNote = "rate limited — retrying \(formatDate(until))"
             } else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                self.claude = nil; self.claudeError = "HTTP \(code) from usage endpoint"
+                self.claudeNote = "HTTP \(code) from usage endpoint"
             }
             DispatchQueue.main.async { self.render() }
         }.resume()
     }
 
+    @objc func manualRefresh() {
+        claudeBackoffUntil = nil // user explicitly asked — bypass backoff
+        refresh()
+    }
+
     private func render() {
-        let cl = claude.map { "CL \(pct($0.five_hour?.utilization))%" } ?? "CL ⚠️"
+        let cl: String
+        if let u = claude {
+            cl = "CL \(pct(u.five_hour?.utilization))%" + (claudeNote != nil ? "·" : "")
+        } else {
+            cl = "CL ⚠️"
+        }
         let cx = codex.map { "CX \(pct($0.limits.primary?.used_percent))%" } ?? "CX —"
         statusItem.button?.title = "\(cl) · \(cx)"
         rebuildMenu()
@@ -226,9 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Claude
         row("CLAUDE")
-        if let error = claudeError {
-            row("  ⚠️ \(error)")
-        } else if let u = claude {
+        if let u = claude {
             if let w = u.five_hour {
                 row("  5-hour  \(bar(w.utilization ?? 0)) \(pct(w.utilization))%")
                 row("    resets \(formatResetISO(w.resets_at))")
@@ -241,6 +265,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let sym = (e.currency ?? "") == "USD" ? "$" : ""
                 row(String(format: "  Extra  %@%.0f / %@%.0f", sym, e.used_credits ?? 0, sym, e.monthly_limit ?? 0))
             }
+            if let note = claudeNote {
+                row("  ⚠️ \(note)")
+                row("    showing last reading from \(relativeAge(claudeUpdatedAt))")
+            }
+        } else if let note = claudeNote {
+            row("  ⚠️ \(note)")
         } else {
             row("  Loading…")
         }
@@ -265,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        let refreshItem = NSMenuItem(title: "Refresh now", action: #selector(refresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "Refresh now", action: #selector(manualRefresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
